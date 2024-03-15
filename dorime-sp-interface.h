@@ -28,6 +28,8 @@ typedef uint8_t  (*dirSelection)(dorime_interface_dir_e dir);
 typedef uint32_t (*getCnt)();
 typedef void 	 (*lock)();
 typedef void 	 (*unlock)();
+typedef void*    (*memAlloc)(uint32_t size);
+typedef void	 (*memFree)(void* p);
 
 /** Publics **/
 /** Must be source code defined for the chipset **/
