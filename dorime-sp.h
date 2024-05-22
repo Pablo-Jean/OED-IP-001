@@ -16,14 +16,18 @@
 #include <stddef.h>
 #include <stdlib.h>
 #include <string.h>
+#include <stdbool.h>
+#include <sys/cdefs.h>
+
+#include "aux/crc32.h"
 
 #include "dorime-sp-interface.h"
 
 /*
  * Data Packet Structure
  *
- * | Header | Version | Pck ID | ADDR | Len | Data | CRC | Tail |
- *    1B        2B        1B      2B     2B   Len    1B     1B
+ * | Header | Version | Pck ID | ADDR | Len | Data  | CRC | Tail |
+ *    1B        2B        4B      2B    2B     Len    4B     1B
  *
  *    Header: The first packet, to indicate a start of a transmission,
  *    		and identify the Packet Type
@@ -38,7 +42,8 @@
  *    Data: The useful information
  *    CRC: CRC-8 Calculation for check if data is not corrupted.
  *    		The calculation starts in Header, ending on the Data
- *    Tail: Sinalyze the end of the communication
+ *    Tail: Sinalyze the end of the communication. Works with crc to check packet
+ *    		integrity
  *
  */
 
@@ -57,6 +62,9 @@
 #define DORIME_HEADER_RESP			0xA6
 #define DORIME_TAIL					0xED
 
+#define DORIME_PACKET_ACK			0x0000
+#define DORIME_PACKET_NOT_ACK		0x0101
+
 #define DORIME_ADDR_CONTROLLER		0x0000
 #define DORIME_ADDR_BROADCAST		0xFFFF
 
@@ -65,12 +73,24 @@
 
 #define DORIME_FXN_SET_TX(handle, pTx)			handle->fxns._tx = pTx
 #define DORIME_FXN_SET_RX(handle, pRx)			handle->fxns._rx = pRx
+#define DORIME_FXN_SET_ABORT(handle, pAbort)	handle->fxns._abort = pAbort
 #define DORIME_FXN_SET_DIR(handle, pDir)		handle->fxns._dir = pDir
 #define DORIME_FXN_SET_LOCK(handle, pLock)		handle>fxns._lock = pLock
 #define DORIME_FXN_SET_UNLOCK(handle, pUnlock)	handle>fxns._unlock = pUnlock
 #define DORIME_FXN_SET_TCKCNT(handle, pCnt)		handle>fxns._tickCont = pCnt
 #define DORIME_FXN_SET_MALLOC(handle, pMalloc)	handle>fxns._memAlloc = pMalloc
 #define DORIME_FXN_SET_FREE(handle, pFree)		handle>fxns._memFree = pFree
+
+/*
+ * Configuration Macros
+ */
+
+// 'DORIME_REDUCED_RAM true' will implements a union
+// to hold packets structure. For production we recommend to use
+// 'true', and for debugging, use false
+#ifndef DORIME_REDUCED_RAM
+#define DORIME_REDUCED_RAM		false
+#endif
 
 /**
  * Enumerates
@@ -80,7 +100,7 @@ typedef enum{
 	DORIME_EVT_ADDR_MATCH,
 	DORIME_EVT_DATA_REC,
 	DORIME_EVT_RESP_REC,
-	DORIME_EVT_CRC_ERR,
+	DORIME_EVT_REC_FAILED,
 	DORIME_EVT_ACK_OK
 }dorime_event_e;
 
@@ -101,20 +121,28 @@ typedef enum{
 }dorime_err_e;
 
 typedef enum{
-	STATE_IDLE,
-	STATE_ADDR_MATCH,
-	STATE_WAITING_PACKET,
-	STATE_RECEIVED_PACKET,
-	STATE_PACKET_FAILED,
+	DOR_STATE_IDLE,
 
-	STATE_START_SEND,
-	STATE_START_WAITING_ACK,
-	STATE_START_ACK,
-	STATE_SEND_DATA,
-	STATE_SEND_WAITING_ACK,
-	STATE_SEND_ACK,
+	DOR_STATE_ADDR_CHECK,
+	DOR_STATE_SEND_ACK,
+	DOR_STATE_WAITING_ACK_SENDED,
+	DOR_STATE_SEND_ACK_FINISHED,
+	DOR_STATE_WAITING_PACKET,
+	DOR_STATE_RECEIVED_PACKET,
+	DOR_STATE_PACKET_FAILED,
 
-	STATE_TIMEOUT
+	DOR_STATE_START_SEND,
+	DOR_STATE_WAITING_START_SENDED,
+	DOR_STATE_SEND_START_FINISHED,
+	DOR_STATE_START_WAITING_ACK,
+	DOR_STATE_START_REC_ACK,
+	DOR_STATE_SEND_DATA,
+	DOR_STATE_SEND_WAITING_ACK,
+	DOR_STATE_SEND_REC_ACK,
+
+	DOR_STATE_ABORT,
+	DOR_STATE_COOLDOWN,
+	DOR_STATE_TIMEOUT
 }dorime_state_e;
 
 /**
@@ -134,6 +162,37 @@ typedef struct{
 	uint16_t addr;
 }dorime_evparams_addr_match_t;
 
+typedef struct __packed{
+	uint8_t header;
+	uint16_t version;
+	uint32_t ID;
+	uint16_t addr;
+	uint16_t len;
+	uint32_t crc;
+	uint8_t tail;
+}dorime_pck_start_t;
+
+typedef struct __packed{
+	uint8_t header;
+	uint16_t version;
+	uint32_t ID;
+	uint16_t addr;
+	uint16_t ack;
+	uint32_t crc;
+	uint8_t tail;
+}dorime_pck_ack_t;
+
+typedef struct __packed{
+	uint8_t header;
+	uint16_t version;
+	uint32_t ID;
+	uint16_t addr;
+	uint16_t len;
+	uint8_t *data;
+	uint32_t crc;
+	uint8_t tail;
+}dorime_pck_data_t;
+
 typedef struct{
 	uint16_t u16Address;
 	uint32_t u32MsPerCount;
@@ -144,6 +203,7 @@ typedef struct{
 		serialRx _rx;
 		dirSelection _dir;
 		getCnt _tickCont;
+		serialAbortAll _abort;
 		lock _lock;
 		unlock _unlock;
 		memAlloc _memAlloc;
@@ -151,12 +211,35 @@ typedef struct{
 	}fxns;
 	// interns
 	struct {
+		uint64_t u64TimeoutWaiting;
+		uint64_t u64Tick;
+		uint32_t u32SendTimeout;
+		uint32_t u32ReceiveTimeout;
+		uint32_t u32CooldownTimeout;
+
+		uint32_t u32ID;
+		uint16_t u16DestAddr;
 		dorime_dev_type_e enType;
-		uint32_t u32Cnt;
 		dorime_state_e enState;
-		uint32_t u32DataLen;
+		uint16_t u16DataLen;
 		uint8_t u8InitFlag;
+		dorime_interface_dir_e enInterfaceDir;
+		bool TxIsWaiting;
+		bool RxIsWaiting;
+		bool isCoolDownCounting;
 	}_internal;
+	// packets
+#if (DORIME_REDUCED_RAM == false)
+	struct{
+#else
+	union{
+#endif
+		dorime_pck_start_t Start;
+		dorime_pck_ack_t Ack;
+		dorime_pck_data_t Data;
+		uint8_t *Buffer;
+		uint32_t BufferLen;
+	}packet;
 }dorime_t;
 
 /**
@@ -165,7 +248,7 @@ typedef struct{
 
 dorime_err_e dorime_init(dorime_t *control);
 
-dorime_err_e dorime_operation(dorime_t *control);
+dorime_err_e dorime_handler(dorime_t *control);
 
 dorime_err_e dorime_send_data(dorime_t *control, uint8_t *data, uint16_t len);
 
@@ -174,6 +257,11 @@ dorime_err_e dorime_abort(dorime_t *control);
 dorime_err_e dorime_rx_event(dorime_t *control);
 
 dorime_err_e dorime_tx_event(dorime_t *control);
+
+// Weak routines
+// User can replace this functions to build a routine
+// with a better performance
+uint32_t dorime_crc32(uint8_t *arr, uint32_t len);
 
 // callbacks
 
